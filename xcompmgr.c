@@ -1308,6 +1308,12 @@ static unsigned int
 get_opacity_prop (Display *dpy, win *w, unsigned int def);
 
 static void
+set_opacity_prop(Display *dpy, Window win, unsigned long opacity);
+
+static void
+set_inactive_one(Display *dpy, win *w);
+
+static void
 configure_win (Display *dpy, XConfigureEvent *ce);
 
 static void
@@ -1327,7 +1333,13 @@ map_win (Display *dpy, Window id, unsigned long sequence, Bool fade)
 
     /* select before reading the property so that no property changes are lost */
     XSelectInput (dpy, id, PropertyChangeMask);
-    w->opacity = get_opacity_prop (dpy, w, OPAQUE);
+    if (!inactive_enabled) {
+        w->opacity = get_opacity_prop (dpy, w, OPAQUE);
+    } else {
+        //w->opacity = INACTIVE_OPACITY;
+        //set_opacity_prop(dpy, w->id, w->opacity);
+        set_inactive_one(dpy, w);
+    }
 
     determine_mode (dpy, w);
 
@@ -2038,6 +2050,67 @@ set_inactive(Display *dpy) {
   }
 }
 
+static char *
+get_window_name(Display *dpy, Window win) {
+  Atom actual_type;
+  int actual_format, result;
+  unsigned long nitems, bytes_after;
+  unsigned char *prop_return = NULL;
+
+  Atom name_atom = XInternAtom(dpy, "_NET_WM_NAME", False);
+
+  result = XGetWindowProperty(
+    dpy, win, name_atom, 0L, sizeof(Atom),
+    False, AnyPropertyType, /*XA_ATOM,*/ &actual_type,
+    &actual_format, &nitems, &bytes_after,
+    &prop_return);
+
+  if (result != Success) {
+    prop_return = "Not found.\n";
+  }
+
+  return prop_return;
+}
+
+
+static void
+set_inactive_one(Display *dpy, win *w) {
+  XWindowAttributes attr;
+  Atom window_type;
+
+
+  Window old_active_window = get_active_win(dpy, root);
+
+  printf("OLD ACTIVE: %u\n", (unsigned int)old_active_window);
+  printf("TARGET WINDOW: %u\n", (unsigned int)w->id);
+  printf("WINDOW NAME: %s\n", get_window_name(dpy, w->id));
+
+  if (w->id == old_active_window) {
+    printf("ACTIVE WINDOW\n");
+    set_opacity_prop(dpy, w->id, OPAQUE);
+    w->opacity = OPAQUE;
+    return;
+  }
+
+  window_type = get_window_type(dpy, w->id);
+
+  if (window_type == winType[WINTYPE_DESKTOP]
+      || window_type == winType[WINTYPE_UTILITY]
+      || window_type == winType[WINTYPE_DOCK]) {
+    printf("RETURNING\n");
+    return;
+  }
+
+  XGetWindowAttributes(dpy, w->id, &attr);
+  if (attr.override_redirect == True) return;
+#if DEBUG_EVENTS
+  printf("found inactive window\n");
+#endif
+  set_opacity_prop(dpy, w->id, INACTIVE_OPACITY);
+  w->opacity = INACTIVE_OPACITY;
+}
+
+
 
 
 
@@ -2265,14 +2338,14 @@ main (int argc, char **argv)
 	    break;
         case 'i':
             inactive_enabled = True;
+            //winTypeOpacity[WINTYPE_NORMAL] =
+            //    ((double)INACTIVE_OPACITY) / OPAQUE;
             break;
 	default:
 	    usage (argv[0]);
 	    break;
 	}
     }
-
-    //winTypeOpacity[WINTYPE_NORMAL] = INACTIVE_OPACITY / OPAQUE;
 
     if (noDockShadow)
         winTypeShadow[WINTYPE_DOCK] = False;
@@ -2349,10 +2422,6 @@ main (int argc, char **argv)
 
     root_width = DisplayWidth (dpy, scr);
     root_height = DisplayHeight (dpy, scr);
-
-    if (inactive_enabled) {
-        set_inactive(dpy);
-    }
 
     rootPicture = XRenderCreatePicture (dpy, root,
 					XRenderFindVisualFormat (dpy,

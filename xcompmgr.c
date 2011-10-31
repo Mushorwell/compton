@@ -37,6 +37,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <limits.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
@@ -150,6 +151,7 @@ Bool		synchronize;
 int		composite_opcode;
 
 /* find these once and be done with it */
+Atom		activeWindowAtom;
 Atom		opacityAtom;
 Atom            winTypeAtom;
 Atom            winType[NUM_WINTYPES];
@@ -174,7 +176,7 @@ conv            *gaussianMap;
 #define TRANS_OPACITY	0.75
 
 #define DEBUG_REPAINT 0
-#define DEBUG_EVENTS 0
+#define DEBUG_EVENTS 1
 #define MONITOR_REPAINT 0
 
 #define SHADOWS		1
@@ -209,6 +211,8 @@ int	fade_time =	0;
 Bool	fadeTrans = False;
 
 Bool	autoRedirect = False;
+
+Bool inactive_enabled = False;
 
 /* For shadow precomputation */
 int            Gsize = -1;
@@ -1578,49 +1582,31 @@ add_win (Display *dpy, Window id, Window prev)
 	map_win (dpy, id, new->damage_sequence - 1, True);
 }
 
-char
+static char
 is_normal_win(Display *dpy, win *w) {
     if (!w) return 0;
     if (w->windowType == None) {
         w->windowType = get_wintype_prop(dpy, w->id);
     }
+    printf("windowType: %x, WINTYPE_NORMAL: %x\n",
+        w->windowType, WINTYPE_NORMAL);
     return w->windowType == WINTYPE_NORMAL;
-}
-
-void
-set_inactives_transparent(Display *dpy, Window id) {
-    win	*w = find_win (dpy, id);
-    if (is_normal_win(dpy, w)) {
-        set_opacity_prop(dpy, w->id, INACTIVE_OPACITY);
-    }
 }
 
 void
 restack_win (Display *dpy, win *w, Window new_above)
 {
-    //if (w) {
-    if (is_normal_win(dpy, w)) {
-      //w->opacity = OPAQUE;
-      //w->damaged = 1;
-      //repair_win(dpy, w);
-      //map_win();
+    if (is_normal_win(dpy, w) && inactive_enabled) {
+      long op;
 
-      //long op;
+      op = get_opacity_prop(dpy, w, INACTIVE_OPACITY);
+      if (op == INACTIVE_OPACITY) set_opacity_prop(dpy, w->id, OPAQUE);
 
-      // make the focused window opaque
-      //op = OPAQUE;
-      //XChangeProperty(
-      //  dpy, w->id, opacityAtom, XA_CARDINAL, 32,
-      //  PropModeReplace, (unsigned char *)&op, 1L);
-
-      set_opacity_prop(dpy, w->id, OPAQUE);
-
-      // the now inactive window becomes translucent
-      //op = INACTIVE_OPACITY;
-      //XChangeProperty(
-      //  dpy, new_above, opacityAtom, XA_CARDINAL, 32,
-      //  PropModeReplace, (unsigned char *)&op, 1L);
-      set_opacity_prop(dpy, new_above, INACTIVE_OPACITY);
+      win *na = find_win(dpy, new_above);
+      if (na) {
+          op = get_opacity_prop(dpy, na, OPAQUE);
+          if (op == OPAQUE) set_opacity_prop(dpy, new_above, INACTIVE_OPACITY);
+      }
     }
 
     Window  old_above;
@@ -1933,6 +1919,140 @@ expose_root (Display *dpy, Window root, XRectangle *rects, int nrects)
     add_damage (dpy, region);
 }
 
+
+
+
+
+// stuff for setting initial transparency ======================================
+
+
+
+
+static Window *
+get_client_list(Display *dpy, unsigned long *nclients) {
+  Window *clients = NULL;
+  Atom actual_type;
+  int actual_format, result;
+  unsigned long nitems, bytes_after;
+  unsigned char *prop_ret = NULL;
+
+  Atom clientListAtom = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
+
+  result = XGetWindowProperty(
+    dpy, root, clientListAtom,
+    0L, ULONG_MAX, False, XA_WINDOW,
+    &actual_type, &actual_format, &nitems,
+    &bytes_after, &prop_ret);
+
+  if (result == Success) {
+    clients = (Window *)prop_ret;
+    *nclients = nitems;
+  }
+
+  return clients;
+}
+
+static Window
+get_active_win(Display *dpy, Window win) {
+  Window active_win = None;
+  Atom actual_type;
+  int actual_format, result;
+  unsigned long nitems, bytes_after;
+  unsigned char *prop_return = NULL;
+
+  result = XGetWindowProperty(
+    dpy, win, activeWindowAtom,
+    0L, sizeof(Window),
+    False, XA_WINDOW, &actual_type,
+    &actual_format, &nitems, &bytes_after,
+    &prop_return);
+
+  if (result == Success && prop_return) {
+    active_win = *(Window *)prop_return;
+    XFree(prop_return);
+  }
+
+  return active_win;
+}
+
+static Atom
+get_window_type(Display *dpy, Window win) {
+  Atom window_type = None;
+  Atom actual_type;
+  int actual_format, result;
+  unsigned long nitems, bytes_after;
+  unsigned char *prop_return = NULL;
+
+  result = XGetWindowProperty(
+    dpy, win, winTypeAtom, 0L, sizeof(Atom),
+    False, XA_ATOM, &actual_type,
+    &actual_format, &nitems, &bytes_after,
+    &prop_return);
+
+  if (result == Success && prop_return) {
+    window_type = *(Atom *)prop_return;
+    XFree(prop_return);
+  }
+
+  return window_type;
+}
+
+static void
+set_inactive(Display *dpy) {
+
+  unsigned long ntoplevels = 0;
+  XWindowAttributes attr;
+  Atom window_type;
+
+  Window old_active_window = get_active_win(dpy, root);
+
+  Window *toplevels = get_client_list(dpy, &ntoplevels);
+
+  if (toplevels) {
+    int i;
+
+    for (i = 0; i < ntoplevels; i++) {
+      if (toplevels[i] == old_active_window) {
+        set_opacity_prop(dpy, toplevels[i], OPAQUE);
+        continue;
+      }
+
+      window_type = get_window_type(dpy, toplevels[i]);
+
+      if (window_type == winType[WINTYPE_DESKTOP]
+          || window_type == winType[WINTYPE_UTILITY]
+          || window_type == winType[WINTYPE_DOCK]) {
+        continue;
+      }
+
+      XGetWindowAttributes(dpy, toplevels[i], &attr);
+      if (attr.override_redirect == True)
+        continue;
+#if DEBUG_EVENTS
+      printf("found inactive window\n");
+#endif
+      set_opacity_prop(dpy, toplevels[i], INACTIVE_OPACITY);
+    }
+
+    XFree(toplevels);
+  }
+}
+
+
+
+
+
+
+// stuff for setting initial transparency ======================================
+
+
+
+
+
+
+
+
+
 #if DEBUG_EVENTS
 static int
 ev_serial (XEvent *ev)
@@ -1957,6 +2077,8 @@ ev_name (XEvent *ev)
 	return "Reparent";
     case CirculateNotify:
 	return "Circulate";
+    case ConfigureNotify:
+        return "Configure";
     default:
     	if (ev->type == damage_event + XDamageNotify)
 	    return "Damage";
@@ -2002,6 +2124,7 @@ usage (char *program)
     fprintf (stderr, "   -O fade-out-step\n      Specifies the opacity change between steps while fading out. (default 0.03)\n");
     fprintf (stderr, "   -D fade-delta-time\n      Specifies the time between steps in a fade in milliseconds. (default 10)\n");
     fprintf (stderr, "   -m opacity\n      Specifies the opacity for menus. (default 1.0)\n");
+    fprintf (stderr, "   -i\n      Enable transparency for inactive windows.\n");
     fprintf (stderr, "   -a\n      Use automatic server-side compositing. Faster, but no special effects.\n");
     fprintf (stderr, "   -c\n      Draw client-side shadows with fuzzy edges.\n");
     fprintf (stderr, "   -C\n      Avoid drawing shadows on dock/panel windows.\n");
@@ -2072,7 +2195,7 @@ main (int argc, char **argv)
     /* don't bother to draw a shadow for the desktop */
     winTypeShadow[WINTYPE_DESKTOP] = False;
 
-    while ((o = getopt (argc, argv, "D:I:O:d:r:o:m:l:t:scnfFCaS")) != -1)
+    while ((o = getopt (argc, argv, "D:I:O:d:r:o:m:l:t:iscnfFCaS")) != -1)
     {
 	switch (o) {
 	case 'd':
@@ -2140,6 +2263,9 @@ main (int argc, char **argv)
 	case 't':
 	    shadowOffsetY = atoi (optarg);
 	    break;
+        case 'i':
+            inactive_enabled = True;
+            break;
 	default:
 	    usage (argv[0]);
 	    break;
@@ -2194,7 +2320,9 @@ main (int argc, char **argv)
     register_cm(scr);
 
     /* get atoms */
+    activeWindowAtom = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
     opacityAtom = XInternAtom (dpy, OPACITY_PROP, False);
+
     winTypeAtom = XInternAtom (dpy, "_NET_WM_WINDOW_TYPE", False);
     winType[WINTYPE_DESKTOP] = XInternAtom (dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
     winType[WINTYPE_DOCK] = XInternAtom (dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
@@ -2221,6 +2349,10 @@ main (int argc, char **argv)
 
     root_width = DisplayWidth (dpy, scr);
     root_height = DisplayHeight (dpy, scr);
+
+    if (inactive_enabled) {
+        set_inactive(dpy);
+    }
 
     rootPicture = XRenderCreatePicture (dpy, root,
 					XRenderFindVisualFormat (dpy,
@@ -2272,8 +2404,10 @@ main (int argc, char **argv)
 	    if ((ev.type & 0x7f) != KeymapNotify)
 		discard_ignore (dpy, ev.xany.serial);
 #if DEBUG_EVENTS
-	    printf ("event %10.10s serial 0x%08x window 0x%08x\n",
+            if (ev.type != damage_event + XDamageNotify) {
+                printf ("event %10.10s serial 0x%08x window 0x%08x\n",
 		    ev_name(&ev), ev_serial (&ev), ev_window (&ev));
+            }
 #endif
 	    if (!autoRedirect) switch (ev.type) {
 	    case CreateNotify:
@@ -2286,7 +2420,6 @@ main (int argc, char **argv)
 		destroy_win (dpy, ev.xdestroywindow.window, True);
 		break;
 	    case MapNotify:
-                set_inactives_transparent (dpy, ev.xmap.window);
 		map_win (dpy, ev.xmap.window, ev.xmap.serial, True);
 		break;
 	    case UnmapNotify:
